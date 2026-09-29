@@ -1,0 +1,70 @@
+# build dirs
+/build/
+/cmake-build-*/
+/out/
+/build_cache/
+
+# CMake-generated
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# binaries / objects
+src/baseline/cublas_lt/cublas_profiler
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+*.pdb
+
+# CUDA build outputs
+*.ptx
+*.cubin
+*.fatbin
+*.nv_fatbin
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local-only data and outputs (never version)
+/datasets/
+/artifacts/
+
+# Generated figures / images
+*.png
+*.pdf
+*.jpg
+*.jpeg
+*.svg
+*.gif
+
+# Autotuner / ML artifacts
+*.db
+*.db-wal
+*.db-shm
+*.db.bak-*
+*.parquet
+
+# Model checkpoints (local only — never push)
+*.pt
+*.pt2
+*.ubj
+*.pth
+*.ckpt
+
+# Large archives / bundles (local only)
+*.tar
+*.tar.gz
+*.zip
+
+# Cluster checkpoints (local copies)
+autotuner.db
+.vscode
+.cursor
+.claude/
+

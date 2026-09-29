@@ -1,0 +1,325 @@
+#include <chrono>
+#include <iostream>
+#include <thread>
+#include <vector>
+
+#include "cute/tensor.hpp"
+
+#include "cutlass/cutlass.h"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler_params.h"
+
+#include "cutlass/util/packed_stride.hpp"
+
+using namespace cute;
+
+namespace autotuner_scheduler {
+
+// CUTLASS example 48 / tile_scheduler_params: heuristic raster direction and
+// max_swizzle_size cap; Params::initialize resolves both per (M,N,K,tile,cluster).
+template <typename Arguments>
+void configure_optimal_tile_scheduler(Arguments& args) {
+    using RasterOrderOptions =
+        typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90Params::RasterOrderOptions;
+    args.scheduler.raster_order = RasterOrderOptions::Heuristic;
+    args.scheduler.max_swizzle_size = 8;
+}
+
+}  // namespace autotuner_scheduler
+
+#define CUDA_CHECK(status)                                                                       \
+    do {                                                                                         \
+        cudaError_t error = (status);                                                            \
+        if (error != cudaSuccess) {                                                              \
+            std::cerr << "CUDA Error: " << cudaGetErrorString(error) << " at " << __FILE__ << ":" \
+                      << __LINE__ << std::endl;                                                  \
+            std::exit(EXIT_FAILURE);                                                             \
+        }                                                                                        \
+    } while (0)
+
+#define CUTLASS_CHECK(status)                                                 \
+    do {                                                                      \
+        cutlass::Status error = (status);                                     \
+        if (error != cutlass::Status::kSuccess) {                             \
+            std::cerr << "CUTLASS Error at " << __FILE__ << ":" << __LINE__   \
+                      << " (status=" << int(error) << "): "                   \
+                      << cutlassGetStatusString(error) << std::endl;          \
+            (void)cudaGetLastError();                                         \
+            return static_cast<int>(error);                                   \
+        }                                                                     \
+    } while (0)
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+/// GEMM kernel configurations
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+{% for config in kernels %}
+// ==========================================
+// Kernel ID: {{ loop.index0 }}
+// Config: {{ config.name }}
+// ==========================================
+
+namespace Kernel_{{ loop.index0 }} {
+
+    // A matrix configuration
+    using           ElementA    = {{ config.cutlass_type_a }};
+    using           LayoutATag  = {{ config.layout_a }};
+    constexpr int   AlignmentA  = {{ config.alignment_a }};
+
+    // B matrix configuration
+    using           ElementB    = {{ config.cutlass_type_b }};
+    using           LayoutBTag  = {{ config.layout_b }};
+    constexpr int   AlignmentB  = {{ config.alignment_b }};
+
+    // C/D matrix configuration — always ColMajor.
+    // For row-major output use the transpose+swap trick (C^T = B^T * A^T).
+    using           ElementD    = {{ config.cutlass_type_c }};
+    using           ElementC    = {{ config.cutlass_type_c }};
+    using           LayoutCTag  = cutlass::layout::ColumnMajor;
+    using           LayoutDTag  = cutlass::layout::ColumnMajor;
+    constexpr int   AlignmentD  = {{ config.alignment_c }};
+    constexpr int   AlignmentC  = {{ config.alignment_c }};
+
+    // Kernel functional config
+    using ElementAccumulator    = {{ config.cutlass_type_acc }};
+    using ElementCompute        = {{ config.cutlass_type_acc }};
+    using ArchTag               = cutlass::arch::Sm90;
+    using OperatorClass         = {{ config.op_class }};
+
+    // Kernel performance config
+    using MmaTileShape          = Shape<_{{ config.tile_m }}, _{{ config.tile_n }}, _{{ config.tile_k }}>;
+    using ClusterShape          = Shape<_{{ config.cluster_m }}, _{{ config.cluster_n }}, _{{ config.cluster_k }}>;
+    using StageCount            = cutlass::gemm::collective::StageCount<{{ config.stages }}>;
+    using TileSchedulerType     = {{ config.scheduler }};
+
+    // Kernel Scheduling Policies
+    using MainloopScheduleType  = {{ config.kernel_schedule }};
+    using EpilogueScheduleType  = {{ config.epilogue_schedule }};
+    using EpilogueTile          = cutlass::epilogue::collective::EpilogueTileAuto;
+
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        MmaTileShape, ClusterShape,
+        EpilogueTile,
+        ElementAccumulator, ElementAccumulator,
+        ElementC, LayoutCTag, AlignmentC,
+        ElementD, LayoutDTag, AlignmentD,
+        EpilogueScheduleType
+    >::CollectiveOp;
+
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        ElementA, LayoutATag, AlignmentA,
+        ElementB, LayoutBTag, AlignmentB,
+        ElementAccumulator,
+        MmaTileShape, ClusterShape,
+        StageCount,
+        MainloopScheduleType
+    >::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int,int,int,int>,
+        CollectiveMainloop,
+        CollectiveEpilogue,
+        TileSchedulerType
+        >;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+}
+{% endfor %}
+
+template <typename GemmType>
+class BenchmarkRunner {
+private:
+    using ElementA = typename GemmType::ElementA;
+    using ElementB = typename GemmType::ElementB;
+    using ElementC = typename GemmType::ElementC;
+    using ElementAccumulator = typename GemmType::ElementAccumulator;
+
+    using StrideA = typename GemmType::GemmKernel::StrideA;
+    using StrideB = typename GemmType::GemmKernel::StrideB;
+    using StrideC = typename GemmType::GemmKernel::StrideC;
+    using StrideD = typename GemmType::GemmKernel::StrideD;
+
+    // num_copies pointers for A and B (ping-pong rotation)
+    // D is a single buffer (write-only, no rotation needed)
+    void** ptrs_A_;
+    void** ptrs_B_;
+    void*  ptr_D_;
+    int    num_copies_;
+    int    M_, N_, K_, device_id_;
+    int    raster_order_, swizzle_size_, splits_;
+
+    GemmType gemm_op_;
+    typename GemmType::Arguments args_;
+    cudaStream_t stream_ = nullptr;
+    void* workspace_ = nullptr;
+    size_t workspace_size_ = 0;
+
+    int setup() {
+        auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M_, K_, 1));
+        auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N_, K_, 1));
+        auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M_, N_, 1));
+        auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M_, N_, 1));
+
+        cutlass::KernelHardwareInfo hw_info = cutlass::KernelHardwareInfo::make_kernel_hardware_info<typename GemmType::GemmKernel>(device_id_);
+
+        args_ = typename GemmType::Arguments{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M_, N_, K_, 1},
+            {
+                (ElementA*)ptrs_A_[0], stride_A,
+                (ElementB*)ptrs_B_[0], stride_B,
+            },
+            {
+                {ElementAccumulator(1.0f), ElementAccumulator(0.0f)},
+                (ElementC*)ptr_D_, stride_C,
+                (ElementC*)ptr_D_, stride_D
+            },
+            hw_info
+        };
+
+        // raster_order_: 0 = AlongM, 1 = AlongN, -1 = Heuristic. splits applies to Stream-K only.
+        if (raster_order_ == -1 && swizzle_size_ == 1 && splits_ == 1) {
+            autotuner_scheduler::configure_optimal_tile_scheduler(args_);
+        } else {
+            if constexpr (!std::is_const_v<decltype(args_.scheduler.max_swizzle_size)>) {
+                args_.scheduler.max_swizzle_size = swizzle_size_;
+            }
+            if constexpr (!std::is_const_v<decltype(args_.scheduler.raster_order)>) {
+                using RasterEnum = decltype(args_.scheduler.raster_order);
+                switch (raster_order_) {
+                    case 0:  args_.scheduler.raster_order = RasterEnum::AlongM; break;
+                    case 1:  args_.scheduler.raster_order = RasterEnum::AlongN; break;
+                    default: args_.scheduler.raster_order = RasterEnum::Heuristic; break;
+                }
+            }
+            if constexpr (std::is_same_v<typename GemmType::GemmKernel::TileSchedulerTag, cutlass::gemm::StreamKScheduler>) {
+                args_.scheduler.splits = splits_;
+            }
+        }
+
+        CUTLASS_CHECK(gemm_op_.can_implement(args_));
+
+        CUDA_CHECK(cudaStreamCreate(&stream_));
+
+        workspace_size_ = GemmType::get_workspace_size(args_);
+        if (workspace_size_ > 0) {
+            CUDA_CHECK(cudaMalloc(&workspace_, workspace_size_));
+        }
+
+        CUTLASS_CHECK(gemm_op_.initialize(args_, workspace_, stream_));
+        return 0;
+    }
+
+    int warmup(int iters) {
+        for (int i = 0; i < iters; i++) {
+            // Zero workspace before each run for Stream-K barrier correctness
+            if (workspace_size_ > 0) {
+                CUDA_CHECK(cudaMemsetAsync(workspace_, 0, workspace_size_, stream_));
+            }
+            CUTLASS_CHECK(gemm_op_.run(stream_));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream_));
+        return 0;
+    }
+
+    int profile(int num_rounds, int iters_per_round, float* out_ms) {
+        std::vector<cudaEvent_t> starts(num_rounds), stops(num_rounds);
+        for (int r = 0; r < num_rounds; r++) {
+            CUDA_CHECK(cudaEventCreate(&starts[r]));
+            CUDA_CHECK(cudaEventCreate(&stops[r]));
+        }
+
+        int iter = 0;
+        for (int r = 0; r < num_rounds; r++) {
+            CUDA_CHECK(cudaEventRecord(starts[r], stream_));
+
+            for (int i = 0; i < iters_per_round; i++, iter++) {
+                // Swap to the next buffer set so A and B are cold in L2
+                args_.mainloop.ptr_A = (ElementA*)ptrs_A_[iter % num_copies_];
+                args_.mainloop.ptr_B = (ElementB*)ptrs_B_[iter % num_copies_];
+                CUTLASS_CHECK(gemm_op_.update(args_, workspace_));
+
+                // Zero workspace before each run for Stream-K barrier correctness
+                if (workspace_size_ > 0) {
+                    CUDA_CHECK(cudaMemsetAsync(workspace_, 0, workspace_size_, stream_));
+                }
+
+                CUTLASS_CHECK(gemm_op_.run(stream_));
+            }
+
+            CUDA_CHECK(cudaEventRecord(stops[r], stream_));
+            CUDA_CHECK(cudaStreamSynchronize(stream_));
+
+            if (r < num_rounds - 1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+
+        for (int r = 0; r < num_rounds; r++) {
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, starts[r], stops[r]));
+            out_ms[r] = ms / iters_per_round;
+            CUDA_CHECK(cudaEventDestroy(starts[r]));
+            CUDA_CHECK(cudaEventDestroy(stops[r]));
+        }
+        return 0;
+    }
+
+public:
+    BenchmarkRunner(void** ptrs_A, void** ptrs_B, void* ptr_D, int num_copies, int M, int N, int K, int device_id,
+                    int raster_order, int swizzle_size, int splits)
+        : ptrs_A_(ptrs_A), ptrs_B_(ptrs_B), ptr_D_(ptr_D), num_copies_(num_copies), M_(M), N_(N), K_(K), device_id_(device_id),
+          raster_order_(raster_order), swizzle_size_(swizzle_size), splits_(splits) {}
+
+    BenchmarkRunner(const BenchmarkRunner&) = delete;
+    BenchmarkRunner& operator=(const BenchmarkRunner&) = delete;
+
+    ~BenchmarkRunner() {
+        if (workspace_) {
+            cudaFree(workspace_);
+        }
+
+        if (stream_) {
+            cudaStreamDestroy(stream_);
+        }
+    }
+
+    int run(int warmup_iters, int num_rounds, int iters_per_round, float* out_ms) {
+        int setup_status = setup();
+        if (setup_status != 0) {
+            return setup_status;
+        }
+
+        if (warmup(warmup_iters) != 0) return -1;
+        if (profile(num_rounds, iters_per_round, out_ms) != 0) return -1;
+        return 0;
+    }
+};
+
+extern "C" int benchmark_kernel(int kernel_id, void** ptrs_A, void** ptrs_B, void* ptr_D, int num_copies, int M, int N, int K, int warmup, int num_rounds, int iters_per_round, int raster_order, int swizzle_size, int splits, float* out_ms) {
+    int device_id = 0;
+    CUDA_CHECK(cudaGetDevice(&device_id));
+
+    switch (kernel_id) {
+        {% for config in kernels %}
+        case {{ loop.index0 }}: {
+            BenchmarkRunner<Kernel_{{ loop.index0 }}::Gemm> runner(ptrs_A, ptrs_B, ptr_D, num_copies, M, N, K, device_id, raster_order, swizzle_size, splits);
+            return runner.run(warmup, num_rounds, iters_per_round, out_ms);
+        }
+        {% endfor %}
+        default:
+            std::cerr << "Invalid kernel ID: " << kernel_id << std::endl;
+            return -1;
+    }
+}
+
+extern "C" int run_kernel_once(int kernel_id, void** ptrs_A, void** ptrs_B, void* ptr_D, int num_copies, int M, int N, int K) {
+    float ms;
+    return benchmark_kernel(kernel_id, ptrs_A, ptrs_B, ptr_D, num_copies, M, N, K, 0, 1, 1, -1, 1, 1, &ms);
+}

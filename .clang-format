@@ -1,0 +1,42 @@
+# clang-format configuration
+BasedOnStyle: Chromium
+
+# --- Indentation & spacing ---
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+AllowShortFunctionsOnASingleLine: All
+
+# --- Access specifiers ---
+AccessModifierOffset: -4
+
+# --- Comments ---
+SpacesBeforeTrailingComments: 1
+AlignTrailingComments: false
+
+# --- Constructor initializer lists ---
+BreakConstructorInitializers: BeforeColon
+PackConstructorInitializers: NextLine
+
+# --- Includes ---
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<.*>'
+    Priority: 1
+  - Regex: '^".*"'
+    Priority: 2
+  - Regex: '.*'
+    Priority: 3
+SortIncludes: true
+
+# --- Templates / Braces ---
+AlwaysBreakTemplateDeclarations: Yes
+BraceWrapping:
+  AfterFunction: false
+  AfterControlStatement: false
+  AfterClass: false
+  AfterStruct: false
+  AfterNamespace: false
+  BeforeCatch: true
+  BeforeElse: true

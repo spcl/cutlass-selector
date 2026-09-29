@@ -1,0 +1,6 @@
+[submodule "src/extern/cutlass"]
+	path = src/extern/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
+[submodule "benchmarks/extern/deepbench"]
+	path = benchmarks/extern/deepbench
+	url = https://github.com/baidu-research/deepbench

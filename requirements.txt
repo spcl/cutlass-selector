@@ -1,0 +1,13 @@
+# Install PyTorch first, matching your CUDA version: https://pytorch.org/get-started/locally/
+# Floors mark APIs the code relies on; tested versions are listed in README.md.
+torch>=2.2          # torch.export with dynamic shapes (model_mlp.pt2)
+jinja2
+numpy
+pandas
+pyarrow
+scikit-learn
+xgboost>=2.0        # device= parameter
+optuna
+matplotlib
+scipy
+pytest

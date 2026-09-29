@@ -1,0 +1,11 @@
+[tool.ruff]
+line-length = 120
+exclude = [
+    "build_cache",
+    "extern",
+    ".venv",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]  # pycodestyle errors/warnings, pyflakes, isort
+ignore = ["E501"]               # line length handled by formatter, not linter
